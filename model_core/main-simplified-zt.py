@@ -10,8 +10,8 @@ import math
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-TS_TOKEN = '填入 Tushare Token' 
-INDEX_CODE = '603122'
+TS_TOKEN = '填入 Tushare Token2682' 
+INDEX_CODE = 2682
 # START_DATE = '20150101'
 # END_DATE = '20240101'
 TEST_END_DATE = '20260101'
@@ -21,8 +21,8 @@ CSV_PATH = 'stockinfo.csv'
 
 BATCH_SIZE = 1024
 TRAIN_ITERATIONS = 400     
-MAX_SEQ_LEN = 8            # 限制公式长度，防止过拟合
-COST_RATE = 0.0005         # 双边万一 (ETF/IC期货费率较低)，设为万五偏保守
+MAX_SEQ_LEN = 15            # 限制公式长度，防止过拟合
+COST_RATE = 0.0005         
 
 DATA_CACHE_PATH = 'data_cache_final.parquet'
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,7 +74,7 @@ OPS_CONFIG = [
     ('TS_RANK20', lambda x: _ts_zscore(x, 20), 1),
 ]
 
-FEATURES = ['RET', 'RET5', 'VOL_CHG', 'V_RET', 'TREND'] 
+FEATURES = ['RET', 'RET5', 'VOL_CHG', 'V_RET', 'TREND','FANS','SBBR','ORG','EM','TH','TURNOVER','TDXGZ'] 
 
 VOCAB = FEATURES + [cfg[0] for cfg in OPS_CONFIG]
 VOCAB_SIZE = len(VOCAB)
@@ -104,10 +104,10 @@ class AlphaGPT(nn.Module):
         return self.head_actor(last), self.head_critic(last)
 
 class DataEngine:
-    def __init__(self):
+    def __init__(self,input_pd):
         # self.pro = ts.pro_api(TS_TOKEN)
-        self.df_tmp = pd.read_csv(CSV_PATH)
-        
+        # self.df_tmp = pd.read_csv(CSV_PATH)
+        self.df_tmp = input_pd
     def load(self):
         # if os.path.exists(DATA_CACHE_PATH):
         #     df = pd.read_parquet(DATA_CACHE_PATH)
@@ -124,15 +124,25 @@ class DataEngine:
                 
         #     df = df.sort_values('trade_date').reset_index(drop=True)
         #     df.to_parquet(DATA_CACHE_PATH)
-        df = self.df_tmp[self.df_tmp['codelist'] == INDEX_CODE]
+        # df = self.df_tmp[self.df_tmp['codelist'] == INDEX_CODE]
+        df = self.df_tmp
             
-        for col in ['open', 'high', 'low', 'close', 'vol']:
+        
+        for col in ['open', 'high', 'low', 'close', 'vol','fans','sbbr','org','em','th','tdxgz','turnover']:
             df[col] = pd.to_numeric(df[col], errors='coerce').ffill().bfill()
-            
+        # from pprint import pprint
+        # pprint(df)
         self.dates = pd.to_datetime(df['trade_date'])
         
         close = df['close'].values.astype(np.float32)
         open_ = df['open'].values.astype(np.float32)
+        fans = df['fans'].values.astype(np.float32)
+        sbbr = df['sbbr'].values.astype(np.float32)
+        org = df['org'].values.astype(np.float32)
+        em = df['em'].values.astype(np.float32)
+        th = df['th'].values.astype(np.float32)
+        tdxgz = df['tdxgz'].values.astype(np.float32)
+        turnover = df['turnover'].values.astype(np.float32)
 
         vol = df['vol'].values.astype(np.float32)
         
@@ -168,7 +178,14 @@ class DataEngine:
             torch.from_numpy(robust_norm(ret5)).to(DEVICE),
             torch.from_numpy(robust_norm(vol_chg)).to(DEVICE),
             torch.from_numpy(robust_norm(v_ret)).to(DEVICE),
-            torch.from_numpy(robust_norm(trend)).to(DEVICE)
+            torch.from_numpy(robust_norm(trend)).to(DEVICE),
+            torch.from_numpy(robust_norm(fans)).to(DEVICE),
+            torch.from_numpy(robust_norm(sbbr)).to(DEVICE),
+            torch.from_numpy(robust_norm(org)).to(DEVICE),
+            torch.from_numpy(robust_norm(em)).to(DEVICE),
+            torch.from_numpy(robust_norm(th)).to(DEVICE),
+            torch.from_numpy(robust_norm(turnover)).to(DEVICE),
+            torch.from_numpy(robust_norm(tdxgz)).to(DEVICE)
         ])
         
         open_tensor = torch.from_numpy(open_).to(DEVICE)
@@ -181,11 +198,11 @@ class DataEngine:
 
         # 在 DataEngine.load() 中添加  
         close_tensor = torch.from_numpy(close).to(DEVICE)  
+        
         close_t1 = torch.roll(close_tensor, -1)  
         daily_return = (close_t1 - close_tensor) / (close_tensor + 1e-6)  
-  
-        # 涨停阈值（A股通常为10%，可根据实际情况调整）  
-        LIMIT_UP_THRESHOLD = 0.095  # 9.5%作为保守判断  
+         
+        LIMIT_UP_THRESHOLD = 0.095  
         self.target_limit_up = (daily_return >= LIMIT_UP_THRESHOLD).float()  
         self.target_limit_up[-1] = 0.0  # 最后一天无标签
         
@@ -301,7 +318,7 @@ class DeepQuantMiner:
             # 惩罚项  
             if accuracy < 0.5: reward = -2.0  # 准确率低于随机  
             if recall < 0.1: reward -= 1.0     # 召回率太低  
-            if (pred == 0).all(): reward = -2.0  # 从不预测涨停  
+            if (pred == 0).all(): reward = -2.0  #
               
             rewards[i] = reward  
           
@@ -413,7 +430,7 @@ def final_reality_check(miner, engine):
     recall = recall_score(test_labels, predictions, zero_division=0)  
     f1 = f1_score(test_labels, predictions, zero_division=0)  
     cm = confusion_matrix(test_labels, predictions)  
-      
+    seq_dict.update({int(ele):{'formula':str(formula_str),'cm':cm.tolist()}})
         
     print(f"Test Period    : {test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}")
     print(f"Accuracy    : {accuracy:.2%}")  
@@ -426,8 +443,19 @@ def final_reality_check(miner, engine):
     
 
 if __name__ == "__main__":
-    eng = DataEngine()
-    eng.load()
-    miner = DeepQuantMiner(eng)
-    miner.train()
-    final_reality_check(miner, eng)
+    pd_data = pd.read_csv(CSV_PATH)
+    import json
+    
+    unique_values = pd_data['codelist'].unique()
+    seq_dict={}
+    for ele in unique_values:
+        subset = pd_data[pd_data['codelist'] == ele]    
+        eng = DataEngine(subset)
+        eng.load()
+        miner = DeepQuantMiner(eng)
+        miner.train()
+        final_reality_check(miner, eng)
+        with open('data.json', 'w', encoding='utf-8') as f:
+            json.dump(seq_dict, f, indent=2, ensure_ascii=False)
+    
+    
