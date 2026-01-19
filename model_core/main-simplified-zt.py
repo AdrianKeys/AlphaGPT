@@ -177,6 +177,18 @@ class DataEngine:
         
         self.target_oto_ret = (open_t2 - open_t1) / (open_t1 + 1e-6)
         self.target_oto_ret[-2:] = 0.0
+
+
+        # 在 DataEngine.load() 中添加  
+        close_tensor = torch.from_numpy(close).to(DEVICE)  
+        close_t1 = torch.roll(close_tensor, -1)  
+        daily_return = (close_t1 - close_tensor) / (close_tensor + 1e-6)  
+  
+        # 涨停阈值（A股通常为10%，可根据实际情况调整）  
+        LIMIT_UP_THRESHOLD = 0.095  # 9.5%作为保守判断  
+        self.target_limit_up = (daily_return >= LIMIT_UP_THRESHOLD).float()  
+        self.target_limit_up[-1] = 0.0  # 最后一天无标签
+        
         
         self.raw_open = open_tensor
         self.raw_close = torch.from_numpy(close).to(DEVICE)
@@ -251,9 +263,8 @@ class DeepQuantMiner:
     def backtest(self, factors):
         if factors.shape[0] == 0: return torch.tensor([], device=DEVICE)
         
-        split = self.engine.split_idx
-        # 使用 Open-to-Open 的收益率
-        target = self.engine.target_oto_ret[:split]
+        split = self.engine.split_idx  
+        target = self.engine.target_limit_up[:split]  # 改为二分类标签 
         
         rewards = torch.zeros(factors.shape[0], device=DEVICE)
         
@@ -263,43 +274,41 @@ class DeepQuantMiner:
             if torch.isnan(f).all() or (f == 0).all() or f.numel() == 0:
                 rewards[i] = -2.0
                 continue
-                
-            sig = torch.tanh(f) 
-            pos = torch.sign(sig)
-            
-            turnover = torch.abs(pos - torch.roll(pos, 1))
-            if turnover.numel() > 0:
-                turnover[0] = 0.0
-            else:
-                rewards[i] = -2.0
-                continue
-            
-            # 净收益
-            pnl = pos * target - turnover * COST_RATE
-            
-            if pnl.numel() < 10: # 数据太少不具有统计意义
-                rewards[i] = -2.0
-                continue
-                
-            mu = pnl.mean()
-            std = pnl.std() + 1e-6
-            
-            # 计算下行风险
-            downside_returns = pnl[pnl < 0]
-            if downside_returns.numel() > 5:
-                down_std = downside_returns.std() + 1e-6
-                sortino = mu / down_std * 15.87 
-            else:
-                sortino = mu / std * 15.87
-            
-            # 惩罚项
-            if mu < 0: sortino = -2.0
-            if turnover.mean() > 0.5: sortino -= 1.0 # 惩罚过度交易
-            if (pos == 0).all(): sortino = -2.0      # 惩罚不持仓
-            
-            rewards[i] = sortino
-            
+            # 生成预测：因子值大于0预测涨停，小于0预测不涨停  
+            pred = (f > 0).float()  
+          
+            if pred.numel() < 10:  
+                rewards[i] = -2.0  
+                continue  
+          
+            # 计算分类指标  
+            correct = (pred == target).float()  
+            accuracy = correct.mean()  
+            # 计算精确率和召回率  
+            true_positives = ((pred == 1) & (target == 1)).sum()  
+            false_positives = ((pred == 1) & (target == 0)).sum()  
+            false_negatives = ((pred == 0) & (target == 1)).sum()  
+              
+            precision = true_positives / (true_positives + false_positives + 1e-6)  
+            recall = true_positives / (true_positives + false_negatives + 1e-6)  
+              
+            # 使用F1-score作为奖励（也可以根据业务需求调整权重）  
+            f1_score = 2 * precision * recall / (precision + recall + 1e-6)  
+              
+            # 归一化到合理范围  
+            reward = f1_score * 10 - 5  # 将[0,1]映射到[-5,5]  
+              
+            # 惩罚项  
+            if accuracy < 0.5: reward = -2.0  # 准确率低于随机  
+            if recall < 0.1: reward -= 1.0     # 召回率太低  
+            if (pred == 0).all(): reward = -2.0  # 从不预测涨停  
+              
+            rewards[i] = reward  
+          
         return torch.clamp(rewards, -3, 5)
+
+            
+            
     def train(self):
         print(f"Training for Stable Profit... MAX_LEN={MAX_SEQ_LEN}")
         pbar = tqdm(range(TRAIN_ITERATIONS))
@@ -390,71 +399,31 @@ def final_reality_check(miner, engine):
     test_dates = engine.dates[split:]
     test_factors = factor_all[split:].cpu().numpy()
     
-    # 使用 Open-to-Open 收益
-    # 注意：target_oto_ret[t] 对应的是 t+1 开盘买, t+2 开盘卖的收益
-    # 所以我们的 signal[t] 应该和 target_oto_ret[t] 对齐
-    test_ret = engine.target_oto_ret[split:].cpu().numpy()
+    # 改为使用涨停标签  
+    test_labels = engine.target_limit_up[split:].cpu().numpy()  
+      
+    # 预测  
+    predictions = (test_factors > 0).astype(int)  
     
-    # 减少噪音
-    rolling_mean_factor = pd.Series(test_factors).rolling(3).mean().fillna(0).values
-    signal = np.tanh(test_factors)
-    
-    # 仓位
-    position = np.sign(signal)
-    
-    # 检查涨跌停/停牌 (Limit Move Check)
-    # 这里认为如果 next_open 相对于 close 涨跌幅超过 9.5%，则无法成交
-    # raw_close[t], raw_open[t+1]
-    # 需要对齐时间轴。target_oto_ret 对应的是 t+1 到 t+2。
-    # 我们检查 t+1 开盘是否可交易。
-    
-    raw_close = engine.raw_close[split:].cpu().numpy()
-    raw_open_next = engine.raw_open[split:].cpu().numpy() # 这里稍微错位，简化处理
-    # 实际上，DataEngine需要更精细的时间对齐来做Limit Check，这里做个简单近似
-    
-    # 换手
-    turnover = np.abs(position - np.roll(position, 1))
-    turnover[0] = 0
-    
-    # PnL
-    daily_ret = position * test_ret - turnover * COST_RATE
-    
-    # 4. 统计
-    equity = (1 + daily_ret).cumprod()
-    
-    total_ret = equity[-1] - 1
-    ann_ret = equity[-1] ** (252/len(equity)) - 1
-    vol = np.std(daily_ret) * np.sqrt(252)
-    sharpe = (ann_ret - 0.02) / (vol + 1e-6)
-    
-    # Max Drawdown
-    dd = 1 - equity / np.maximum.accumulate(equity)
-    max_dd = np.max(dd)
-    calmar = ann_ret / (max_dd + 1e-6)
-    
+    # 计算分类指标  
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix  
+      
+    accuracy = accuracy_score(test_labels, predictions)  
+    precision = precision_score(test_labels, predictions, zero_division=0)  
+    recall = recall_score(test_labels, predictions, zero_division=0)  
+    f1 = f1_score(test_labels, predictions, zero_division=0)  
+    cm = confusion_matrix(test_labels, predictions)  
+      
+        
     print(f"Test Period    : {test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}")
-    print(f"Ann. Return    : {ann_ret:.2%}")
-    print(f"Ann. Volatility: {vol:.2%}")
-    print(f"Sharpe Ratio   : {sharpe:.2f}")
-    print(f"Max Drawdown   : {max_dd:.2%}")
-    print(f"Calmar Ratio   : {calmar:.2f}")
-    print("-" * 60)
+    print(f"Accuracy    : {accuracy:.2%}")  
+    print(f"Precision   : {precision:.2%}")  
+    print(f"Recall      : {recall:.2%}")  
+    print(f"F1-Score    : {f1:.2f}")  
+    print(f"Confusion Matrix:\n{cm}")
+    print("-" * 60)  
     
-    plt.style.use('bmh')
-    plt.figure(figsize=(12, 6))
     
-    plt.plot(test_dates, equity, label='Strategy (Open-to-Open)', linewidth=1.5)
-    
-    bench_ret = test_ret
-    bench_equity = (1 + bench_ret).cumprod()
-    plt.plot(test_dates, bench_equity, label='Benchmark (CSI 300)', alpha=0.5, linewidth=1)
-    
-    plt.title(f'Strict OOS Backtest: Ann Ret {ann_ret:.1%} | Sharpe {sharpe:.2f}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('strategy_performance.png')
-    print("Chart saved to 'strategy_performance.png'")
 
 if __name__ == "__main__":
     eng = DataEngine()
